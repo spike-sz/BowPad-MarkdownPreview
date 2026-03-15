@@ -1,0 +1,631 @@
+// MarkdownPreview - BowPad Plugin
+// Renders the current Markdown document as HTML and opens it in the default browser.
+// Produces a Typora-like clean, elegant rendering.
+//
+// Version: 1.00
+// Author: BowPad Community
+
+function Version() { return 100; }
+
+// ============================================================================
+// Markdown Parser (JScript-compatible, no ES6)
+// ============================================================================
+
+function MarkdownParser() {
+    this.footnotes = {};
+    this.footnoteIndex = 0;
+    this.refLinks = {};
+}
+
+MarkdownParser.prototype.escapeHtml = function(text) {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+};
+
+// Parse reference-style links: [id]: url "title"
+MarkdownParser.prototype.collectRefLinks = function(text) {
+    var self = this;
+    var re = /^ {0,3}\[([^\]]+)\]:\s+<?([^\s>]+)>?(?:\s+["'(]([^"')]+)["')])?$/gm;
+    var match;
+    while ((match = re.exec(text)) !== null) {
+        self.refLinks[match[1].toLowerCase()] = { url: match[2], title: match[3] || "" };
+    }
+    return text.replace(re, "");
+};
+
+// Inline parsing: bold, italic, code, links, images, strikethrough, etc.
+MarkdownParser.prototype.parseInline = function(text) {
+    var self = this;
+
+    // Inline code (backtick)
+    text = text.replace(/`([^`]+)`/g, function(m, c) {
+        return '<code>' + self.escapeHtml(c) + '</code>';
+    });
+
+    // Images: ![alt](src "title")
+    text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function(m, alt, src, title) {
+        var t = title ? ' title="' + self.escapeHtml(title) + '"' : '';
+        return '<img src="' + self.escapeHtml(src) + '" alt="' + self.escapeHtml(alt) + '"' + t + ' />';
+    });
+
+    // Links: [text](url "title")
+    text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function(m, txt, url, title) {
+        var t = title ? ' title="' + self.escapeHtml(title) + '"' : '';
+        return '<a href="' + self.escapeHtml(url) + '"' + t + '>' + txt + '</a>';
+    });
+
+    // Reference links: [text][id] or [text][]
+    text = text.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, function(m, txt, id) {
+        var key = (id || txt).toLowerCase();
+        var ref = self.refLinks[key];
+        if (ref) {
+            var t = ref.title ? ' title="' + self.escapeHtml(ref.title) + '"' : '';
+            return '<a href="' + self.escapeHtml(ref.url) + '"' + t + '>' + txt + '</a>';
+        }
+        return m;
+    });
+
+    // Strikethrough ~~text~~
+    text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
+
+    // Bold + Italic ***text*** or ___text___
+    text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    text = text.replace(/___(.+?)___/g, '<strong><em>$1</em></strong>');
+
+    // Bold **text** or __text__
+    text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+
+    // Italic *text* or _text_
+    text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    text = text.replace(/\b_(.+?)_\b/g, '<em>$1</em>');
+
+    // Highlight ==text==
+    text = text.replace(/==(.+?)==/g, '<mark>$1</mark>');
+
+    // Superscript ^text^
+    text = text.replace(/\^([^\^]+)\^/g, '<sup>$1</sup>');
+
+    // Subscript ~text~  (single tilde, not double)
+    text = text.replace(/~([^~]+)~/g, '<sub>$1</sub>');
+
+    // Auto-link URLs
+    text = text.replace(/(^|[^"=])(https?:\/\/[^\s<]+)/g, function(m, pre, url) {
+        return pre + '<a href="' + url + '">' + url + '</a>';
+    });
+
+    // Line break (two trailing spaces or backslash)
+    text = text.replace(/  $/gm, '<br/>');
+    text = text.replace(/\\$/gm, '<br/>');
+
+    return text;
+};
+
+// Parse a table block
+MarkdownParser.prototype.parseTable = function(lines) {
+    if (lines.length < 2) return null;
+
+    // Check if second line is alignment row
+    var alignRow = lines[1];
+    if (!/^[\s|:\-]+$/.test(alignRow)) return null;
+
+    var parseRow = function(line) {
+        line = line.replace(/^\|/, "").replace(/\|$/, "");
+        return line.split("|");
+    };
+
+    var headers = parseRow(lines[0]);
+    var aligns = parseRow(lines[1]);
+    var alignments = [];
+    var i, j;
+
+    for (i = 0; i < aligns.length; i++) {
+        var a = aligns[i].replace(/^\s+|\s+$/g, "");
+        if (/^:-+:$/.test(a)) alignments.push("center");
+        else if (/^-+:$/.test(a)) alignments.push("right");
+        else if (/^:-+$/.test(a)) alignments.push("left");
+        else alignments.push("");
+    }
+
+    var html = '<table>\n<thead>\n<tr>\n';
+    for (i = 0; i < headers.length; i++) {
+        var style = alignments[i] ? ' style="text-align:' + alignments[i] + '"' : '';
+        html += '<th' + style + '>' + this.parseInline(headers[i].replace(/^\s+|\s+$/g, "")) + '</th>\n';
+    }
+    html += '</tr>\n</thead>\n<tbody>\n';
+
+    for (i = 2; i < lines.length; i++) {
+        var cells = parseRow(lines[i]);
+        html += '<tr>\n';
+        for (j = 0; j < headers.length; j++) {
+            var style2 = alignments[j] ? ' style="text-align:' + alignments[j] + '"' : '';
+            var cell = (j < cells.length) ? cells[j].replace(/^\s+|\s+$/g, "") : "";
+            html += '<td' + style2 + '>' + this.parseInline(cell) + '</td>\n';
+        }
+        html += '</tr>\n';
+    }
+    html += '</tbody>\n</table>';
+    return html;
+};
+
+// Parse ordered/unordered list block
+MarkdownParser.prototype.parseList = function(lines, startIdx) {
+    var result = [];
+    var i = startIdx;
+    var firstLine = lines[i];
+    var isOrdered = /^\s*\d+\.\s/.test(firstLine);
+    var listTag = isOrdered ? "ol" : "ul";
+    var itemRe = isOrdered ? /^\s*\d+\.\s+(.*)$/ : /^\s*[\*\-\+]\s+(.*)$/;
+    var indent = firstLine.match(/^(\s*)/)[1].length;
+
+    result.push('<' + listTag + '>');
+    while (i < lines.length) {
+        var line = lines[i];
+        var match = line.match(itemRe);
+        if (!match) {
+            // Check if this is a continuation or nested
+            var curIndent = line.match(/^(\s*)/)[1].length;
+            if (curIndent > indent && result.length > 0) {
+                // Continuation of previous item
+                result[result.length - 1] = result[result.length - 1].replace(/<\/li>$/, "");
+                result.push(this.parseInline(line.replace(/^\s+/, "")) + '</li>');
+                i++;
+                continue;
+            }
+            break;
+        }
+        // Check for task list items
+        var content = match[1];
+        var taskMatch = content.match(/^\[([ xX])\]\s*(.*)/);
+        if (taskMatch) {
+            var checked = (taskMatch[1] === 'x' || taskMatch[1] === 'X') ? ' checked disabled' : ' disabled';
+            result.push('<li class="task-list-item"><input type="checkbox"' + checked + '/> ' + this.parseInline(taskMatch[2]) + '</li>');
+        } else {
+            result.push('<li>' + this.parseInline(content) + '</li>');
+        }
+        i++;
+    }
+    result.push('</' + listTag + '>');
+    return { html: result.join('\n'), endIdx: i };
+};
+
+// Main parse function
+MarkdownParser.prototype.parse = function(markdown) {
+    var self = this;
+
+    // Normalize line endings
+    markdown = markdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    // Collect reference links
+    markdown = this.collectRefLinks(markdown);
+
+    var lines = markdown.split("\n");
+    var html = [];
+    var i = 0;
+    var inParagraph = false;
+    var paragraphLines = [];
+
+    var flushParagraph = function() {
+        if (paragraphLines.length > 0) {
+            html.push('<p>' + self.parseInline(paragraphLines.join('\n')) + '</p>');
+            paragraphLines = [];
+        }
+        inParagraph = false;
+    };
+
+    while (i < lines.length) {
+        var line = lines[i];
+        var trimmed = line.replace(/^\s+|\s+$/g, "");
+
+        // Empty line
+        if (trimmed === "") {
+            flushParagraph();
+            i++;
+            continue;
+        }
+
+        // Fenced code block ``` (allow up to 3 leading spaces per CommonMark spec)
+        var fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})\s*(\w*)/);
+        if (fenceMatch) {
+            flushParagraph();
+            var fence = fenceMatch[1].charAt(0);
+            var fenceLen = fenceMatch[1].length;
+            var lang = fenceMatch[2];
+            var codeLines = [];
+            i++;
+            while (i < lines.length) {
+                // Match closing fence: same char, at least same length, allow leading spaces
+                var closeRe = new RegExp("^ {0,3}" + fence + "{" + fenceLen + ",}\\s*$");
+                if (closeRe.test(lines[i])) {
+                    i++;
+                    break;
+                }
+                codeLines.push(self.escapeHtml(lines[i]));
+                i++;
+            }
+            var langAttr = lang ? ' class="language-' + self.escapeHtml(lang) + '"' : '';
+            html.push('<pre><code' + langAttr + '>' + codeLines.join('\n') + '</code></pre>');
+            continue;
+        }
+
+        // Indented code block (4 spaces or 1 tab)
+        if (/^(    |\t)/.test(line) && !inParagraph) {
+            flushParagraph();
+            var codeLines2 = [];
+            while (i < lines.length && (/^(    |\t)/.test(lines[i]) || lines[i].replace(/^\s+|\s+$/g, "") === "")) {
+                codeLines2.push(self.escapeHtml(lines[i].replace(/^    /, "").replace(/^\t/, "")));
+                i++;
+            }
+            // Remove trailing empty lines
+            while (codeLines2.length > 0 && codeLines2[codeLines2.length - 1].replace(/^\s+|\s+$/g, "") === "") {
+                codeLines2.pop();
+            }
+            html.push('<pre><code>' + codeLines2.join('\n') + '</code></pre>');
+            continue;
+        }
+
+        // ATX Headings: # to ######
+        var headMatch = line.match(/^(#{1,6})\s+(.+?)(?:\s+#+)?$/);
+        if (headMatch) {
+            flushParagraph();
+            var level = headMatch[1].length;
+            var headContent = self.parseInline(headMatch[2]);
+            html.push('<h' + level + '>' + headContent + '</h' + level + '>');
+            i++;
+            continue;
+        }
+
+        // Setext heading (underline style)
+        if (i + 1 < lines.length && /^={2,}\s*$/.test(lines[i + 1]) && trimmed !== "") {
+            flushParagraph();
+            html.push('<h1>' + self.parseInline(trimmed) + '</h1>');
+            i += 2;
+            continue;
+        }
+        if (i + 1 < lines.length && /^-{2,}\s*$/.test(lines[i + 1]) && trimmed !== "" && !/^\s*[\*\-\+]\s/.test(trimmed)) {
+            flushParagraph();
+            html.push('<h2>' + self.parseInline(trimmed) + '</h2>');
+            i += 2;
+            continue;
+        }
+
+        // Horizontal rule
+        if (/^(\*{3,}|-{3,}|_{3,})\s*$/.test(trimmed)) {
+            flushParagraph();
+            html.push('<hr/>');
+            i++;
+            continue;
+        }
+
+        // Blockquote
+        if (/^>\s?/.test(line)) {
+            flushParagraph();
+            var quoteLines = [];
+            while (i < lines.length && (/^>\s?/.test(lines[i]) || (lines[i].replace(/^\s+|\s+$/g, "") !== "" && quoteLines.length > 0))) {
+                if (/^>\s?/.test(lines[i])) {
+                    quoteLines.push(lines[i].replace(/^>\s?/, ""));
+                } else if (lines[i].replace(/^\s+|\s+$/g, "") !== "") {
+                    quoteLines.push(lines[i]);
+                } else {
+                    break;
+                }
+                i++;
+            }
+            // Recursive parse for nested content
+            var innerParser = new MarkdownParser();
+            innerParser.refLinks = self.refLinks;
+            html.push('<blockquote>' + innerParser.parse(quoteLines.join('\n')) + '</blockquote>');
+            continue;
+        }
+
+        // Table
+        if (/\|/.test(line) && i + 1 < lines.length && /^[\s|:\-]+$/.test(lines[i + 1])) {
+            flushParagraph();
+            var tableLines = [];
+            while (i < lines.length && /\|/.test(lines[i])) {
+                tableLines.push(lines[i]);
+                i++;
+            }
+            var tableHtml = self.parseTable(tableLines);
+            if (tableHtml) {
+                html.push(tableHtml);
+            }
+            continue;
+        }
+
+        // Unordered list
+        if (/^\s*[\*\-\+]\s+/.test(line)) {
+            flushParagraph();
+            var listResult = self.parseList(lines, i);
+            html.push(listResult.html);
+            i = listResult.endIdx;
+            continue;
+        }
+
+        // Ordered list
+        if (/^\s*\d+\.\s+/.test(line)) {
+            flushParagraph();
+            var listResult2 = self.parseList(lines, i);
+            html.push(listResult2.html);
+            i = listResult2.endIdx;
+            continue;
+        }
+
+        // Math block ($$...$$)
+        if (/^\$\$/.test(trimmed)) {
+            flushParagraph();
+            var mathLines = [];
+            i++;
+            while (i < lines.length) {
+                if (/^\$\$/.test(lines[i].replace(/^\s+|\s+$/g, ""))) {
+                    i++;
+                    break;
+                }
+                mathLines.push(self.escapeHtml(lines[i]));
+                i++;
+            }
+            html.push('<div class="math-block">$$' + mathLines.join('\n') + '$$</div>');
+            continue;
+        }
+
+        // Regular paragraph text
+        paragraphLines.push(line);
+        inParagraph = true;
+        i++;
+    }
+
+    flushParagraph();
+    return html.join('\n');
+};
+
+// ============================================================================
+// Typora-like HTML template with CSS + highlight.js + MathJax
+// ============================================================================
+function getHtmlTemplate(title, body, docPath) {
+    // Build base URL for relative image paths
+    var baseTag = '';
+    if (docPath) {
+        var lastSlash = docPath.lastIndexOf("\\");
+        if (lastSlash < 0) lastSlash = docPath.lastIndexOf("/");
+        if (lastSlash >= 0) {
+            var dir = docPath.substring(0, lastSlash + 1).replace(/\\/g, "/");
+            baseTag = '<base href="file:///' + dir + '">\n';
+        }
+    }
+
+    return '<!DOCTYPE html>\n'
+    + '<html lang="en">\n'
+    + '<head>\n'
+    + '<meta charset="UTF-8">\n'
+    + '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+    + baseTag
+    + '<title>' + title + '</title>\n'
+    + '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)">\n'
+    + '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" media="(prefers-color-scheme: dark)">\n'
+    + '<style>\n'
+    + ':root {\n'
+    + '  --bg-color: #ffffff;\n'
+    + '  --text-color: #333333;\n'
+    + '  --heading-color: #1a1a1a;\n'
+    + '  --link-color: #4183c4;\n'
+    + '  --code-bg: #f6f8fa;\n'
+    + '  --code-border: #e1e4e8;\n'
+    + '  --blockquote-border: #dfe2e5;\n'
+    + '  --blockquote-color: #6a737d;\n'
+    + '  --table-border: #dfe2e5;\n'
+    + '  --table-header-bg: #f6f8fa;\n'
+    + '  --hr-color: #e1e4e8;\n'
+    + '  --mark-bg: #fff3b0;\n'
+    + '  --shadow-color: rgba(0,0,0,0.05);\n'
+    + '  --selection-bg: #b3d7ff;\n'
+    + '}\n'
+    + '@media (prefers-color-scheme: dark) {\n'
+    + '  :root {\n'
+    + '    --bg-color: #1e1e1e;\n'
+    + '    --text-color: #d4d4d4;\n'
+    + '    --heading-color: #e0e0e0;\n'
+    + '    --link-color: #6cb6ff;\n'
+    + '    --code-bg: #2d2d2d;\n'
+    + '    --code-border: #404040;\n'
+    + '    --blockquote-border: #404040;\n'
+    + '    --blockquote-color: #8b949e;\n'
+    + '    --table-border: #404040;\n'
+    + '    --table-header-bg: #2d2d2d;\n'
+    + '    --hr-color: #404040;\n'
+    + '    --mark-bg: #4a3f00;\n'
+    + '    --shadow-color: rgba(0,0,0,0.3);\n'
+    + '    --selection-bg: #264f78;\n'
+    + '  }\n'
+    + '}\n'
+    + '* { margin:0; padding:0; box-sizing:border-box; }\n'
+    + 'html { font-size:16px; -webkit-font-smoothing:antialiased; scroll-behavior:smooth; }\n'
+    + '::selection { background:var(--selection-bg); }\n'
+    + 'body {\n'
+    + '  font-family: "Segoe UI","Microsoft YaHei","Source Han Sans SC",-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;\n'
+    + '  line-height:1.75; color:var(--text-color); background:var(--bg-color);\n'
+    + '  max-width:860px; margin:0 auto; padding:40px 30px 80px;\n'
+    + '}\n'
+    + 'h1,h2,h3,h4,h5,h6 { color:var(--heading-color); font-weight:600; line-height:1.35; margin-top:1.8em; margin-bottom:0.6em; }\n'
+    + 'h1 { font-size:2em; padding-bottom:0.3em; border-bottom:1px solid var(--hr-color); }\n'
+    + 'h2 { font-size:1.65em; padding-bottom:0.25em; border-bottom:1px solid var(--hr-color); }\n'
+    + 'h3 { font-size:1.35em; } h4 { font-size:1.15em; } h5 { font-size:1em; }\n'
+    + 'h6 { font-size:0.9em; color:var(--blockquote-color); }\n'
+    + 'h1:first-child,h2:first-child,h3:first-child { margin-top:0; }\n'
+    + 'p { margin-bottom:1em; word-wrap:break-word; }\n'
+    + 'a { color:var(--link-color); text-decoration:none; border-bottom:1px solid transparent; transition:border-color 0.2s; }\n'
+    + 'a:hover { border-bottom-color:var(--link-color); }\n'
+    + 'strong { font-weight:600; } em { font-style:italic; }\n'
+    + 'code {\n'
+    + '  font-family:"Cascadia Code","Fira Code","JetBrains Mono",Consolas,"Source Code Pro",monospace;\n'
+    + '  font-size:0.9em; background:var(--code-bg); border:1px solid var(--code-border); border-radius:4px; padding:0.15em 0.4em;\n'
+    + '}\n'
+    + 'pre { position:relative; background:var(--code-bg); border:1px solid var(--code-border); border-radius:6px; padding:16px 20px; overflow-x:auto; margin-bottom:1em; line-height:1.5; }\n'
+    + 'pre code { background:none; border:none; padding:0; font-size:0.875em; border-radius:0; }\n'
+    + 'pre .lang-label { position:absolute; top:4px; right:8px; font-size:0.7em; color:var(--blockquote-color); text-transform:uppercase; user-select:none; }\n'
+    + 'blockquote { border-left:4px solid var(--blockquote-border); padding:0.5em 1em; margin:0 0 1em 0; color:var(--blockquote-color); }\n'
+    + 'blockquote p:last-child { margin-bottom:0; } blockquote blockquote { margin-top:0.5em; }\n'
+    + 'ul,ol { padding-left:2em; margin-bottom:1em; }\n'
+    + 'li { margin-bottom:0.25em; }\n'
+    + 'li>ul,li>ol { margin-top:0.25em; margin-bottom:0; }\n'
+    + '.task-list-item { list-style-type:none; margin-left:-1.5em; }\n'
+    + '.task-list-item input[type="checkbox"] { margin-right:0.5em; vertical-align:middle; }\n'
+    + 'table { width:100%; border-collapse:collapse; margin-bottom:1em; font-size:0.95em; }\n'
+    + 'thead { background:var(--table-header-bg); }\n'
+    + 'th,td { border:1px solid var(--table-border); padding:8px 13px; text-align:left; }\n'
+    + 'th { font-weight:600; }\n'
+    + 'tbody tr:nth-child(even) { background:var(--table-header-bg); }\n'
+    + 'tbody tr:hover { background:var(--code-bg); }\n'
+    + 'hr { border:none; border-top:1px solid var(--hr-color); margin:2em 0; }\n'
+    + 'img { max-width:100%; height:auto; display:block; margin:1em 0; border-radius:4px; box-shadow:0 2px 12px var(--shadow-color); }\n'
+    + 'mark { background:var(--mark-bg); padding:0.1em 0.3em; border-radius:3px; }\n'
+    + 'del { color:var(--blockquote-color); text-decoration:line-through; }\n'
+    + '.math-block { text-align:center; margin:1em 0; padding:1em; background:var(--code-bg); border-radius:6px; overflow-x:auto; }\n'
+    + '@media print {\n'
+    + '  body { max-width:none; padding:20px; font-size:12pt; }\n'
+    + '  pre,code { border:1px solid #ddd; }\n'
+    + '  a { color:#333; } a[href]:after { content:" (" attr(href) ")"; font-size:0.8em; }\n'
+    + '}\n'
+    + '@keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }\n'
+    + 'body>* { animation:fadeIn 0.25s ease-out; }\n'
+    + '</style>\n'
+    + '</head>\n'
+    + '<body>\n'
+    + body + '\n'
+    + '<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></' + 'script>\n'
+    + '<script>hljs.highlightAll();</' + 'script>\n'
+    + '<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.js" async></' + 'script>\n'
+    + '</body>\n'
+    + '</html>';
+}
+
+// ============================================================================
+// Main Execute function
+// Click:       Convert markdown -> HTML, write to temp file, open in browser
+// Shift+Click: Convert markdown -> HTML, output to a new BowPad tab
+// ============================================================================
+function Execute() {
+    if (!BowPad.HasActiveDocument) {
+        BowPad.alert("No active document.");
+        return false;
+    }
+
+    var length = BowPad.SciGetLength();
+    if (length === 0) {
+        BowPad.alert("Document is empty.");
+        return false;
+    }
+
+    var markdown = BowPad.SciGetTextRange(0, length);
+    if (!markdown || markdown.length === 0) {
+        BowPad.alert("Failed to read document text.");
+        return false;
+    }
+
+    var title = BowPad.GetCurrentTitle();
+    if (!title) title = "Markdown Preview";
+
+    // Get document file path for resolving relative image paths
+    var docPath = "";
+    try {
+        var docID = BowPad.GetDocIdOfCurrentTab();
+        docPath = BowPad.GetPathForDocID(docID);
+    } catch(ex) {}
+
+    // Parse markdown to HTML
+    var parser = new MarkdownParser();
+    var bodyHtml = parser.parse(markdown);
+    var fullHtml = getHtmlTemplate(title, bodyHtml, docPath);
+
+    // Shift+Click: output to new tab
+    if (BowPad.GetKeyState(0x10)) {
+        BowPad.OpenNewTab();
+        BowPad.SciReplaceSel(fullHtml);
+        BowPad.SciEmptyUndoBuffer();
+        BowPad.SciSetSavePoint();
+        BowPad.SetCurrentTitle("Preview - " + title + ".html");
+        try { BowPad.SetupLexerForLang("HTML"); } catch(e2) {}
+        return true;
+    }
+
+    // Normal click: write temp HTML and open in browser
+    try {
+        var fso = new ActiveXObject("Scripting.FileSystemObject");
+        var tempFolder = fso.GetSpecialFolder(2);
+
+        // Create BowPad subdirectory in temp folder
+        var bowpadDir = tempFolder.Path + "\\BowPad";
+        if (!fso.FolderExists(bowpadDir)) {
+            fso.CreateFolder(bowpadDir);
+        }
+
+        // Build a unique but stable HTML filename:
+        //   {fileName}_{shortHash}_MarkdownPreview.html
+        // The short hash is derived from the full file path, so:
+        //   - Same file always maps to the same HTML (no temp file explosion)
+        //   - Different files with the same name (e.g. multiple README.md) get different hashes
+        var baseName = title || "Untitled";
+        baseName = baseName.replace(/\.(md|markdown|mdown|mkdn|mkd|txt)$/i, "");
+        // Sanitize: replace path-invalid or URL-unfriendly characters with underscore
+        var safeName = baseName.replace(/[\\\/:*?"<>|#%&+{}\s]+/g, "_");
+        safeName = safeName.replace(/^_+|_+$/g, "");
+        if (!safeName) safeName = "Untitled";
+
+        // Simple DJB2-style hash of the full path to distinguish same-name files
+        // Uses the full docPath so "C:\projA\README.md" and "C:\projB\README.md" differ
+        var hashSource = docPath || baseName;
+        var hash = 5381;
+        for (var hi = 0; hi < hashSource.length; hi++) {
+            hash = ((hash * 33) ^ hashSource.charCodeAt(hi)) & 0x7FFFFFFF;
+        }
+        var shortHash = hash.toString(16);  // 6-8 hex chars
+
+        var htmlPath = bowpadDir + "\\" + safeName + "_" + shortHash + "_MarkdownPreview.html";
+
+        var stream = new ActiveXObject("ADODB.Stream");
+        stream.Type = 2;
+        stream.Charset = "UTF-8";
+        stream.Open();
+        stream.WriteText(fullHtml);
+        stream.SaveToFile(htmlPath, 2);
+        stream.Close();
+
+        // Open HTML in the default browser
+        var shellApp = new ActiveXObject("Shell.Application");
+        shellApp.ShellExecute(htmlPath, "", "", "open", 1);
+    }
+    catch (e) {
+        // Fallback: output to new tab
+        BowPad.OpenNewTab();
+        BowPad.SciReplaceSel(fullHtml);
+        BowPad.SciEmptyUndoBuffer();
+        BowPad.SciSetSavePoint();
+        BowPad.SetCurrentTitle("Preview - " + title + ".html");
+        try { BowPad.SetupLexerForLang("HTML"); } catch(e2) {}
+
+        BowPad.alert(
+            "Markdown has been rendered as HTML in a new tab.\n\n"
+            + "Save it as .html and open in a browser for the best viewing experience.\n\n"
+            + "Tip: Next time, ActiveX components may be needed for direct browser preview."
+        );
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Plugin state functions
+// ============================================================================
+function IsEnabled() {
+    if (!BowPad.HasActiveDocument) return false;
+    // Enable for all documents (user may want to preview any text as markdown)
+    return true;
+}
+
+function IsChecked() { return false; }
+
+function OnDocumentOpen(index) { }
+function OnDocumentClose(index) { }
