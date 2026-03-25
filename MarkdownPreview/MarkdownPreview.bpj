@@ -2,10 +2,10 @@
 // Renders the current Markdown document as HTML and opens it in the default browser.
 // Produces a Typora-like clean, elegant rendering.
 //
-// Version: 1.00
+// Version: 1.10
 // Author: BowPad Community
 
-function Version() { return 100; }
+function Version() { return 110; }
 
 // ============================================================================
 // Markdown Parser (JScript-compatible, no ES6)
@@ -15,6 +15,9 @@ function MarkdownParser() {
     this.footnotes = {};
     this.footnoteIndex = 0;
     this.refLinks = {};
+    this.headings = [];   // Collected headings for TOC: {level, text, id}
+    this.headingIdCounts = {};  // Track duplicate heading ids
+    this.basePath = "";   // Base directory for resolving relative image paths (file:/// URL)
 }
 
 MarkdownParser.prototype.escapeHtml = function(text) {
@@ -27,6 +30,25 @@ MarkdownParser.prototype.escapeHtml = function(text) {
 };
 
 // Parse reference-style links: [id]: url "title"
+MarkdownParser.prototype.generateHeadingId = function(text) {
+    // Strip HTML tags from text for ID generation
+    var plain = text.replace(/<[^>]+>/g, "");
+    // Convert to lowercase, replace spaces with hyphens, remove non-alphanumeric (keep CJK chars)
+    var id = plain.replace(/^\s+|\s+$/g, "").toLowerCase();
+    id = id.replace(/\s+/g, "-");
+    // Remove characters that are not alphanumeric, hyphens, underscores, or CJK
+    id = id.replace(/[^\w\u4e00-\u9fff\u3400-\u4dbf\u00C0-\u024F-]/g, "");
+    if (!id) id = "heading";
+    // Handle duplicate ids
+    if (this.headingIdCounts[id] === undefined) {
+        this.headingIdCounts[id] = 0;
+    } else {
+        this.headingIdCounts[id]++;
+        id = id + "-" + this.headingIdCounts[id];
+    }
+    return id;
+};
+
 MarkdownParser.prototype.collectRefLinks = function(text) {
     var self = this;
     var re = /^ {0,3}\[([^\]]+)\]:\s+<?([^\s>]+)>?(?:\s+["'(]([^"')]+)["')])?$/gm;
@@ -49,13 +71,23 @@ MarkdownParser.prototype.parseInline = function(text) {
     // Images: ![alt](src "title")
     text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function(m, alt, src, title) {
         var t = title ? ' title="' + self.escapeHtml(title) + '"' : '';
-        return '<img src="' + self.escapeHtml(src) + '" alt="' + self.escapeHtml(alt) + '"' + t + ' />';
+        var resolvedSrc = src;
+        // Resolve relative image paths to absolute file:/// URLs
+        if (self.basePath && !/^(https?:\/\/|file:\/\/\/|data:)/i.test(src)) {
+            resolvedSrc = self.basePath + src.replace(/\\/g, "/");
+        }
+        return '<img src="' + self.escapeHtml(resolvedSrc) + '" alt="' + self.escapeHtml(alt) + '"' + t + ' />';
     });
 
     // Links: [text](url "title")
     text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function(m, txt, url, title) {
         var t = title ? ' title="' + self.escapeHtml(title) + '"' : '';
-        return '<a href="' + self.escapeHtml(url) + '"' + t + '>' + txt + '</a>';
+        var resolvedUrl = url;
+        // Resolve relative link paths (skip anchors #, absolute URLs, and protocols)
+        if (self.basePath && !/^(#|https?:\/\/|file:\/\/\/|mailto:|data:)/i.test(url)) {
+            resolvedUrl = self.basePath + url.replace(/\\/g, "/");
+        }
+        return '<a href="' + self.escapeHtml(resolvedUrl) + '"' + t + '>' + txt + '</a>';
     });
 
     // Reference links: [text][id] or [text][]
@@ -64,7 +96,12 @@ MarkdownParser.prototype.parseInline = function(text) {
         var ref = self.refLinks[key];
         if (ref) {
             var t = ref.title ? ' title="' + self.escapeHtml(ref.title) + '"' : '';
-            return '<a href="' + self.escapeHtml(ref.url) + '"' + t + '>' + txt + '</a>';
+            var resolvedRefUrl = ref.url;
+            // Resolve relative reference link paths
+            if (self.basePath && !/^(#|https?:\/\/|file:\/\/\/|mailto:|data:)/i.test(ref.url)) {
+                resolvedRefUrl = self.basePath + ref.url.replace(/\\/g, "/");
+            }
+            return '<a href="' + self.escapeHtml(resolvedRefUrl) + '"' + t + '>' + txt + '</a>';
         }
         return m;
     });
@@ -274,7 +311,10 @@ MarkdownParser.prototype.parse = function(markdown) {
             flushParagraph();
             var level = headMatch[1].length;
             var headContent = self.parseInline(headMatch[2]);
-            html.push('<h' + level + '>' + headContent + '</h' + level + '>');
+            var headId = self.generateHeadingId(headContent);
+            var headPlain = headContent.replace(/<[^>]+>/g, "");
+            self.headings.push({level: level, text: headPlain, id: headId});
+            html.push('<h' + level + ' id="' + headId + '">' + headContent + '</h' + level + '>');
             i++;
             continue;
         }
@@ -282,13 +322,21 @@ MarkdownParser.prototype.parse = function(markdown) {
         // Setext heading (underline style)
         if (i + 1 < lines.length && /^={2,}\s*$/.test(lines[i + 1]) && trimmed !== "") {
             flushParagraph();
-            html.push('<h1>' + self.parseInline(trimmed) + '</h1>');
+            var setextContent1 = self.parseInline(trimmed);
+            var setextId1 = self.generateHeadingId(setextContent1);
+            var setextPlain1 = setextContent1.replace(/<[^>]+>/g, "");
+            self.headings.push({level: 1, text: setextPlain1, id: setextId1});
+            html.push('<h1 id="' + setextId1 + '">' + setextContent1 + '</h1>');
             i += 2;
             continue;
         }
         if (i + 1 < lines.length && /^-{2,}\s*$/.test(lines[i + 1]) && trimmed !== "" && !/^\s*[\*\-\+]\s/.test(trimmed)) {
             flushParagraph();
-            html.push('<h2>' + self.parseInline(trimmed) + '</h2>');
+            var setextContent2 = self.parseInline(trimmed);
+            var setextId2 = self.generateHeadingId(setextContent2);
+            var setextPlain2 = setextContent2.replace(/<[^>]+>/g, "");
+            self.headings.push({level: 2, text: setextPlain2, id: setextId2});
+            html.push('<h2 id="' + setextId2 + '">' + setextContent2 + '</h2>');
             i += 2;
             continue;
         }
@@ -385,16 +433,34 @@ MarkdownParser.prototype.parse = function(markdown) {
 // ============================================================================
 // Typora-like HTML template with CSS + highlight.js + MathJax
 // ============================================================================
-function getHtmlTemplate(title, body, docPath) {
-    // Build base URL for relative image paths
-    var baseTag = '';
-    if (docPath) {
-        var lastSlash = docPath.lastIndexOf("\\");
-        if (lastSlash < 0) lastSlash = docPath.lastIndexOf("/");
-        if (lastSlash >= 0) {
-            var dir = docPath.substring(0, lastSlash + 1).replace(/\\/g, "/");
-            baseTag = '<base href="file:///' + dir + '">\n';
+function getHtmlTemplate(title, body, docPath, headings) {
+
+    // Build TOC sidebar HTML from headings
+    var tocHtml = '';
+    if (headings && headings.length > 0) {
+        tocHtml = '<nav id="toc-sidebar">\n';
+        tocHtml += '<div class="toc-header">\n';
+        tocHtml += '<span class="toc-title">\u76EE\u5F55</span>\n';
+        tocHtml += '<button class="toc-toggle" id="toc-toggle-btn" title="Toggle TOC">\u2039</button>\n';
+        tocHtml += '</div>\n';
+        tocHtml += '<div class="toc-content" id="toc-content">\n';
+        tocHtml += '<ul class="toc-list">\n';
+        // Find the minimum heading level to normalize indentation
+        var minLevel = 6;
+        var hi;
+        for (hi = 0; hi < headings.length; hi++) {
+            if (headings[hi].level < minLevel) minLevel = headings[hi].level;
         }
+        for (hi = 0; hi < headings.length; hi++) {
+            var h = headings[hi];
+            var indent = h.level - minLevel;
+            tocHtml += '<li class="toc-item toc-level-' + indent + '">';
+            tocHtml += '<a href="#' + h.id + '" class="toc-link" data-target="' + h.id + '">' + h.text + '</a>';
+            tocHtml += '</li>\n';
+        }
+        tocHtml += '</ul>\n';
+        tocHtml += '</div>\n';
+        tocHtml += '</nav>\n';
     }
 
     return '<!DOCTYPE html>\n'
@@ -402,7 +468,6 @@ function getHtmlTemplate(title, body, docPath) {
     + '<head>\n'
     + '<meta charset="UTF-8">\n'
     + '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    + baseTag
     + '<title>' + title + '</title>\n'
     + '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)">\n'
     + '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" media="(prefers-color-scheme: dark)">\n'
@@ -422,6 +487,10 @@ function getHtmlTemplate(title, body, docPath) {
     + '  --mark-bg: #fff3b0;\n'
     + '  --shadow-color: rgba(0,0,0,0.05);\n'
     + '  --selection-bg: #b3d7ff;\n'
+    + '  --toc-bg: #f8f9fa;\n'
+    + '  --toc-border: #e1e4e8;\n'
+    + '  --toc-active: #4183c4;\n'
+    + '  --toc-hover-bg: #eef1f5;\n'
     + '}\n'
     + '@media (prefers-color-scheme: dark) {\n'
     + '  :root {\n'
@@ -439,6 +508,10 @@ function getHtmlTemplate(title, body, docPath) {
     + '    --mark-bg: #4a3f00;\n'
     + '    --shadow-color: rgba(0,0,0,0.3);\n'
     + '    --selection-bg: #264f78;\n'
+    + '    --toc-bg: #252526;\n'
+    + '    --toc-border: #404040;\n'
+    + '    --toc-active: #6cb6ff;\n'
+    + '    --toc-hover-bg: #2a2d2e;\n'
     + '  }\n'
     + '}\n'
     + '* { margin:0; padding:0; box-sizing:border-box; }\n'
@@ -447,7 +520,67 @@ function getHtmlTemplate(title, body, docPath) {
     + 'body {\n'
     + '  font-family: "Segoe UI","Microsoft YaHei","Source Han Sans SC",-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;\n'
     + '  line-height:1.75; color:var(--text-color); background:var(--bg-color);\n'
+    + '  margin:0; padding:0;\n'
+    + '}\n'
+    + '#main-content {\n'
     + '  max-width:860px; margin:0 auto; padding:40px 30px 80px;\n'
+    + '}\n'
+    + '/* TOC Sidebar */\n'
+    + '#toc-sidebar {\n'
+    + '  position:fixed; top:0; left:0; width:260px; height:100vh;\n'
+    + '  background:var(--toc-bg); border-right:1px solid var(--toc-border);\n'
+    + '  overflow:hidden; z-index:100;\n'
+    + '  display:flex; flex-direction:column;\n'
+    + '  transition: width 0.3s ease;\n'
+    + '  box-shadow: 2px 0 8px var(--shadow-color);\n'
+    + '}\n'
+    + '#toc-sidebar.collapsed { width:40px; }\n'
+    + '.toc-header {\n'
+    + '  display:flex; align-items:center; justify-content:space-between;\n'
+    + '  padding:16px 16px 12px; border-bottom:1px solid var(--toc-border);\n'
+    + '  flex-shrink:0;\n'
+    + '}\n'
+    + '.toc-title {\n'
+    + '  font-size:0.85em; font-weight:600; text-transform:uppercase; letter-spacing:0.05em;\n'
+    + '  color:var(--heading-color); white-space:nowrap; overflow:hidden;\n'
+    + '}\n'
+    + '.toc-toggle {\n'
+    + '  background:none; border:none; cursor:pointer; font-size:1.2em;\n'
+    + '  color:var(--blockquote-color); padding:2px 6px; border-radius:4px;\n'
+    + '  transition: background 0.2s, transform 0.3s;\n'
+    + '  flex-shrink:0;\n'
+    + '}\n'
+    + '.toc-toggle:hover { background:var(--toc-hover-bg); }\n'
+    + '#toc-sidebar.collapsed .toc-toggle { transform:rotate(180deg); }\n'
+    + '#toc-sidebar.collapsed .toc-title { display:none; }\n'
+    + '.toc-content {\n'
+    + '  flex:1; overflow-y:auto; overflow-x:hidden; padding:12px 0;\n'
+    + '}\n'
+    + '#toc-sidebar.collapsed .toc-content { display:none; }\n'
+    + '.toc-list { list-style:none; margin:0; padding:0; }\n'
+    + '.toc-item { margin:0; }\n'
+    + '.toc-link {\n'
+    + '  display:block; padding:5px 16px 5px 16px; font-size:0.82em;\n'
+    + '  color:var(--text-color); text-decoration:none; border-left:3px solid transparent;\n'
+    + '  transition: all 0.15s ease; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;\n'
+    + '  line-height:1.5;\n'
+    + '}\n'
+    + '.toc-link:hover { background:var(--toc-hover-bg); color:var(--toc-active); border-bottom:none; }\n'
+    + '.toc-link.active { color:var(--toc-active); border-left-color:var(--toc-active); font-weight:600; background:var(--toc-hover-bg); }\n'
+    + '.toc-level-0 .toc-link { padding-left:16px; font-weight:600; }\n'
+    + '.toc-level-1 .toc-link { padding-left:28px; }\n'
+    + '.toc-level-2 .toc-link { padding-left:40px; font-size:0.78em; }\n'
+    + '.toc-level-3 .toc-link { padding-left:52px; font-size:0.78em; }\n'
+    + '.toc-level-4 .toc-link { padding-left:64px; font-size:0.75em; }\n'
+    + '.toc-level-5 .toc-link { padding-left:76px; font-size:0.75em; }\n'
+    + '/* Scrollbar styling for TOC */\n'
+    + '.toc-content::-webkit-scrollbar { width:4px; }\n'
+    + '.toc-content::-webkit-scrollbar-track { background:transparent; }\n'
+    + '.toc-content::-webkit-scrollbar-thumb { background:var(--toc-border); border-radius:4px; }\n'
+    + '.toc-content::-webkit-scrollbar-thumb:hover { background:var(--blockquote-color); }\n'
+    + '/* Responsive: hide sidebar on small screens */\n'
+    + '@media (max-width: 768px) {\n'
+    + '  #toc-sidebar { display:none; }\n'
     + '}\n'
     + 'h1,h2,h3,h4,h5,h6 { color:var(--heading-color); font-weight:600; line-height:1.35; margin-top:1.8em; margin-bottom:0.6em; }\n'
     + 'h1 { font-size:2em; padding-bottom:0.3em; border-bottom:1px solid var(--hr-color); }\n'
@@ -485,7 +618,8 @@ function getHtmlTemplate(title, body, docPath) {
     + 'del { color:var(--blockquote-color); text-decoration:line-through; }\n'
     + '.math-block { text-align:center; margin:1em 0; padding:1em; background:var(--code-bg); border-radius:6px; overflow-x:auto; }\n'
     + '@media print {\n'
-    + '  body { max-width:none; padding:20px; font-size:12pt; }\n'
+    + '  #toc-sidebar { display:none !important; }\n'
+    + '  #main-content { max-width:none; padding:20px; font-size:12pt; }\n'
     + '  pre,code { border:1px solid #ddd; }\n'
     + '  a { color:#333; } a[href]:after { content:" (" attr(href) ")"; font-size:0.8em; }\n'
     + '}\n'
@@ -493,11 +627,69 @@ function getHtmlTemplate(title, body, docPath) {
     + 'body>* { animation:fadeIn 0.25s ease-out; }\n'
     + '</style>\n'
     + '</head>\n'
-    + '<body>\n'
+    + '<body' + (tocHtml ? ' class="has-toc"' : '') + '>\n'
+    + tocHtml
+    + '<div id="main-content">\n'
     + body + '\n'
+    + '</div>\n'
     + '<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></' + 'script>\n'
     + '<script>hljs.highlightAll();</' + 'script>\n'
     + '<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.js" async></' + 'script>\n'
+    + (tocHtml ? '<script>\n'
+    + '(function(){\n'
+    + '  var sidebar = document.getElementById("toc-sidebar");\n'
+    + '  var toggleBtn = document.getElementById("toc-toggle-btn");\n'
+    + '  if (!sidebar || !toggleBtn) return;\n'
+    + '  // Toggle collapse\n'
+    + '  toggleBtn.addEventListener("click", function(){\n'
+    + '    sidebar.classList.toggle("collapsed");\n'
+    + '  });\n'
+    + '  // Active heading highlight on scroll\n'
+    + '  var tocLinks = document.querySelectorAll(".toc-link");\n'
+    + '  var headingEls = [];\n'
+    + '  for (var i = 0; i < tocLinks.length; i++) {\n'
+    + '    var target = tocLinks[i].getAttribute("data-target");\n'
+    + '    var el = document.getElementById(target);\n'
+    + '    if (el) headingEls.push({el: el, link: tocLinks[i]});\n'
+    + '  }\n'
+    + '  function updateActive() {\n'
+    + '    var scrollTop = window.pageYOffset || document.documentElement.scrollTop;\n'
+    + '    var current = null;\n'
+    + '    for (var j = 0; j < headingEls.length; j++) {\n'
+    + '      if (headingEls[j].el.offsetTop <= scrollTop + 80) {\n'
+    + '        current = headingEls[j];\n'
+    + '      }\n'
+    + '    }\n'
+    + '    for (var k = 0; k < headingEls.length; k++) {\n'
+    + '      headingEls[k].link.className = headingEls[k].link.className.replace(/ ?active/g, "");\n'
+    + '    }\n'
+    + '    if (current) {\n'
+    + '      current.link.className += " active";\n'
+    + '      // Scroll active item into view in TOC\n'
+    + '      var tocContent = document.getElementById("toc-content");\n'
+    + '      if (tocContent) {\n'
+    + '        var linkTop = current.link.offsetTop - tocContent.offsetTop;\n'
+    + '        var tocScrollTop = tocContent.scrollTop;\n'
+    + '        var tocHeight = tocContent.clientHeight;\n'
+    + '        if (linkTop < tocScrollTop || linkTop > tocScrollTop + tocHeight - 30) {\n'
+    + '          tocContent.scrollTop = linkTop - tocHeight / 3;\n'
+    + '        }\n'
+    + '      }\n'
+    + '    }\n'
+    + '  }\n'
+    + '  window.addEventListener("scroll", updateActive);\n'
+    + '  updateActive();\n'
+    + '  // Smooth scroll for TOC links\n'
+    + '  for (var m = 0; m < tocLinks.length; m++) {\n'
+    + '    tocLinks[m].addEventListener("click", function(e){\n'
+    + '      e.preventDefault();\n'
+    + '      var tid = this.getAttribute("data-target");\n'
+    + '      var tel = document.getElementById(tid);\n'
+    + '      if (tel) tel.scrollIntoView({behavior:"smooth", block:"start"});\n'
+    + '    });\n'
+    + '  }\n'
+    + '})();\n'
+    + '</' + 'script>\n' : '')
     + '</body>\n'
     + '</html>';
 }
@@ -537,8 +729,16 @@ function Execute() {
 
     // Parse markdown to HTML
     var parser = new MarkdownParser();
+    // Set base path for resolving relative image paths
+    if (docPath) {
+        var lastSlash = docPath.lastIndexOf("\\");
+        if (lastSlash < 0) lastSlash = docPath.lastIndexOf("/");
+        if (lastSlash >= 0) {
+            parser.basePath = "file:///" + docPath.substring(0, lastSlash + 1).replace(/\\/g, "/");
+        }
+    }
     var bodyHtml = parser.parse(markdown);
-    var fullHtml = getHtmlTemplate(title, bodyHtml, docPath);
+    var fullHtml = getHtmlTemplate(title, bodyHtml, docPath, parser.headings);
 
     // Shift+Click: output to new tab
     if (BowPad.GetKeyState(0x10)) {
